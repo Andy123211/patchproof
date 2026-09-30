@@ -9,6 +9,7 @@
     "node": ">=24"
   },
   "scripts": {
+    "test": "tsc -p tsconfig.test.json && node --test",
     "typecheck": "tsc --noEmit",
     "build": "npm run typecheck && ncc build src/index.ts -o dist"
   },

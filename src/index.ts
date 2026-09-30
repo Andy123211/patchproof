@@ -1,72 +1,31 @@
 import * as core from "@actions/core";
 import * as github from "@actions/github";
-import { spawn } from "node:child_process";
+import {
+  DEFAULT_COMMAND_TIMEOUT_MINUTES,
+  parseCommandTimeoutMinutes,
+  runShellCommand,
+} from "./commands.js";
+import { sanitizeChildEnvironment } from "./safety.js";
+import {
+  MAX_GITHUB_PULL_REQUEST_FILES,
+  findHighRiskPaths,
+  findSecretPatterns,
+  getScanCoverage,
+  type ChangedFile,
+  type RiskFinding,
+  type ScanCoverage,
+  type SecretFinding,
+} from "./scan.js";
 
 const MAX_ANNOTATIONS = 30;
 const MAX_SUMMARY_ROWS = 250;
-const CREDENTIAL_ENVIRONMENT_NAME = /(?:token|secret|password|passwd|credential|private.?key|access.?key|auth)/i;
-const ACTION_CONTROL_FILE_ENVIRONMENT_NAMES = new Set([
-  "GITHUB_ENV",
-  "GITHUB_OUTPUT",
-  "GITHUB_PATH",
-  "GITHUB_STEP_SUMMARY",
-  "GITHUB_STATE",
-]);
-const PRIVATE_KEY_PATTERN = /-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----/i;
-
-const SECRET_PATTERNS = [
-  { name: "Private key block", pattern: PRIVATE_KEY_PATTERN },
-  { name: "AWS access key ID", pattern: /\bAKIA[0-9A-Z]{16}\b/ },
-  { name: "GitHub token", pattern: /\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/ },
-  { name: "Slack token", pattern: /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/ },
-  { name: "Google API key", pattern: /\bAIza[0-9A-Za-z_-]{35}\b/ },
-  {
-    name: "Credential-like assignment",
-    pattern: /\b(?:api[_-]?key|client[_-]?secret|access[_-]?token|password)\s*[:=]\s*["']?[A-Za-z0-9_./+=-]{16,}/i,
-  },
-];
-
-const HIGH_RISK_PATH_RULES = [
-  { name: "GitHub workflow or action configuration", pattern: /^\.github\/(?:workflows|actions)\//i },
-  { name: "Repository ownership or security policy", pattern: /(^|\/)(?:CODEOWNERS|SECURITY\.md)$/i },
-  { name: "Repository automation configuration", pattern: /^\.github\/(?:dependabot\.ya?ml|release(?:-please)?(?:\.ya?ml|\.json))$/i },
-  {
-    name: "Dependency manifest or lockfile",
-    pattern: /(^|\/)(?:package\.json|package-lock\.json|pnpm-lock\.yaml|yarn\.lock|requirements[^/]*\.txt|pyproject\.toml|poetry\.lock|Cargo\.(?:toml|lock)|go\.(?:mod|sum))$/i,
-  },
-  {
-    name: "Build, deployment, or infrastructure configuration",
-    pattern: /(^|\/)(?:Dockerfile(?:\.[^/]*)?|Makefile|Jenkinsfile|action\.ya?ml|docker-compose(?:\.[^/]*)?\.ya?ml|compose\.ya?ml|serverless\.ya?ml|cloudbuild\.ya?ml|[^/]+\.tf)$/i,
-  },
-  { name: "Environment, package, or authentication configuration", pattern: /(^|\/)(?:\.npmrc|\.env(?:\.[^/]*)?|[^/]*(?:auth|permission|secret|deploy)[^/]*\.ya?ml)$/i },
-];
-
-interface ChangedFile {
-  filename: string;
-  status: string;
-  patch?: string;
-}
-
-interface SecretFinding {
-  file: string;
-  line: number;
-  patternName: string;
-}
-
-interface RiskFinding {
-  file: string;
-  ruleName: string;
-}
-
-interface AddedLine {
-  lineNumber: number;
-  text: string;
-}
 
 interface CheckResult {
   name: string;
   succeeded: boolean;
   exitCode: number | null;
+  timedOut: boolean;
+  timeoutMinutes: number;
 }
 
 interface CheckCommand {
@@ -74,126 +33,34 @@ interface CheckCommand {
   command: string;
 }
 
-/** Extract added lines and their new-file line numbers from a unified diff patch. */
-function getAddedLines(patch: string): AddedLine[] {
-  const addedLines: AddedLine[] = [];
-  let newLineNumber = 0;
-
-  for (const line of patch.split(/\r?\n/)) {
-    const hunkMatch = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
-    if (hunkMatch !== null) {
-      newLineNumber = Number(hunkMatch[1]);
-      continue;
-    }
-
-    if (line.startsWith("+++") || line.startsWith("\\")) {
-      continue;
-    }
-
-    if (line.startsWith("+")) {
-      addedLines.push({ lineNumber: newLineNumber, text: line.slice(1) });
-      newLineNumber += 1;
-      continue;
-    }
-
-    if (line.startsWith(" ")) {
-      newLineNumber += 1;
-    }
-  }
-
-  return addedLines;
+interface PullRequestApiFile {
+  filename: string;
+  status: string;
+  patch?: string;
+  previous_filename?: string;
 }
 
-function findSecretPatterns(files: ChangedFile[]): SecretFinding[] {
-  const findings: SecretFinding[] = [];
+async function runCheck(
+  name: CheckCommand["name"],
+  command: string,
+  cwd: string,
+  timeoutMinutes: number,
+): Promise<CheckResult> {
+  core.info(`Running configured ${name} check.`);
+  const result = await runShellCommand(command, cwd, timeoutMinutes * 60 * 1000);
+  const succeeded = result.started && !result.timedOut && result.exitCode === 0;
 
-  for (const file of files) {
-    if (file.patch === undefined) {
-      continue;
-    }
-
-    for (const addedLine of getAddedLines(file.patch)) {
-      for (const secretPattern of SECRET_PATTERNS) {
-        if (secretPattern.pattern.test(addedLine.text)) {
-          findings.push({ file: file.filename, line: addedLine.lineNumber, patternName: secretPattern.name });
-        }
-      }
-    }
+  if (succeeded) {
+    core.info(`Configured ${name} check passed.`);
+  } else if (!result.started) {
+    core.warning(`The configured ${name} check could not be started.`);
+  } else if (result.timedOut) {
+    core.warning(`Configured ${name} check exceeded ${timeoutMinutes} minutes and was terminated.`);
+  } else {
+    core.warning(`Configured ${name} check failed${result.exitCode === null ? "" : ` with exit code ${result.exitCode}`}.`);
   }
 
-  return findings;
-}
-
-function findHighRiskPaths(files: ChangedFile[]): RiskFinding[] {
-  const findings: RiskFinding[] = [];
-
-  for (const file of files) {
-    const matchingRule = HIGH_RISK_PATH_RULES.find((rule) => rule.pattern.test(file.filename));
-    if (matchingRule !== undefined) {
-      findings.push({ file: file.filename, ruleName: matchingRule.name });
-    }
-  }
-
-  return findings;
-}
-
-function getSafeChildEnvironment(): NodeJS.ProcessEnv {
-  const safeEnvironment: NodeJS.ProcessEnv = {};
-
-  for (const [name, value] of Object.entries(process.env)) {
-    const normalizedName = name.toUpperCase();
-    if (
-      value === undefined ||
-      ACTION_CONTROL_FILE_ENVIRONMENT_NAMES.has(normalizedName) ||
-      normalizedName.startsWith("ACTIONS_") ||
-      normalizedName.startsWith("INPUT_") ||
-      CREDENTIAL_ENVIRONMENT_NAME.test(name)
-    ) {
-      continue;
-    }
-
-    safeEnvironment[name] = value;
-  }
-
-  return safeEnvironment;
-}
-
-function runCheck(name: CheckCommand["name"], command: string, cwd: string): Promise<CheckResult> {
-  return new Promise((resolve) => {
-    core.info(`Running configured ${name} check.`);
-
-    let childProcess;
-    try {
-      childProcess = spawn(command, [], {
-        cwd,
-        env: getSafeChildEnvironment(),
-        shell: true,
-        stdio: "inherit",
-        windowsHide: true,
-      });
-    } catch {
-      core.warning(`The configured ${name} check could not be started.`);
-      resolve({ name, succeeded: false, exitCode: null });
-      return;
-    }
-
-    let spawnFailed = false;
-    childProcess.once("error", () => {
-      spawnFailed = true;
-      core.warning(`The configured ${name} check could not be started.`);
-    });
-
-    childProcess.once("close", (exitCode) => {
-      const succeeded = !spawnFailed && exitCode === 0;
-      if (succeeded) {
-        core.info(`Configured ${name} check passed.`);
-      } else {
-        core.warning(`Configured ${name} check failed${exitCode === null ? "" : ` with exit code ${exitCode}`}.`);
-      }
-
-      resolve({ name, succeeded, exitCode });
-    });
-  });
+  return { name, succeeded, exitCode: result.exitCode, timedOut: result.timedOut, timeoutMinutes };
 }
 
 function escapeMarkdownCell(value: string): string {
@@ -211,8 +78,17 @@ function addTable(summary: typeof core.summary, rows: string[][]): void {
   summary.addTable(safeRows);
 }
 
-function addFindingAnnotations(secretFindings: SecretFinding[], riskFindings: RiskFinding[]): void {
+function addFindingAnnotations(
+  secretFindings: SecretFinding[],
+  riskFindings: RiskFinding[],
+  coverage: ScanCoverage,
+): void {
   let annotationCount = 0;
+
+  if (!coverage.completeForReturnedFiles && annotationCount < MAX_ANNOTATIONS) {
+    core.warning("Sensitive-pattern scan coverage is incomplete. See the step summary for missing patch files or a possible API cap.");
+    annotationCount += 1;
+  }
 
   for (const finding of secretFindings) {
     if (annotationCount >= MAX_ANNOTATIONS) {
@@ -248,27 +124,61 @@ async function writeSummary(
   files: ChangedFile[],
   secretFindings: SecretFinding[],
   riskFindings: RiskFinding[],
+  coverage: ScanCoverage,
   checkResults: CheckResult[],
 ): Promise<void> {
   const summary = core.summary;
-  const patchAvailableCount = files.filter((file) => file.patch !== undefined).length;
+  const patchAvailableCount = files.length - coverage.missingPatchFiles.length;
+  const coverageReasons: string[] = [];
+  if (coverage.missingPatchFiles.length > 0) {
+    coverageReasons.push(`${coverage.missingPatchFiles.length} returned file(s) had no patch text`);
+  }
+  if (coverage.fileLimitReached) {
+    coverageReasons.push(`the ${MAX_GITHUB_PULL_REQUEST_FILES}-file API response cap may have been reached`);
+  }
+
   const rows: string[][] = [
     ["Check", "Result", "Details"],
     ["Changed files", String(files.length), "Files returned by the GitHub pull request API"],
-    ["Patch availability", `${patchAvailableCount}/${files.length}`, "Some binary or large-file diffs may not include patch text"],
+    [
+      "Diff coverage",
+      coverage.completeForReturnedFiles ? "No known omissions" : "INCOMPLETE",
+      coverageReasons.length > 0
+        ? coverageReasons.join("; ")
+        : "Every returned file included patch text and the result stayed below the API cap",
+    ],
+    ["Patch text", `${patchAvailableCount}/${files.length}`, "Returned files with non-empty patch text"],
+    ["Potential API truncation", coverage.fileLimitReached ? "Possible" : "Not indicated", "At the cap, additional files may be omitted"],
     ["Sensitive patterns", String(secretFindings.length), "Known patterns found on added diff lines only"],
     ["High-risk paths", String(riskFindings.length), "Changed workflow, dependency, build, ownership, or security configuration"],
   ];
 
   for (const result of checkResults) {
+    let details: string;
+    if (result.timedOut) {
+      details = `Timed out after ${result.timeoutMinutes} minutes`;
+    } else if (result.exitCode === null) {
+      details = "Could not start";
+    } else {
+      details = `Exit code ${result.exitCode}`;
+    }
+
     rows.push([
       `${result.name} command`,
       result.succeeded ? "Passed" : "Failed",
-      result.exitCode === null ? "Could not start" : `Exit code ${result.exitCode}`,
+      details,
     ]);
   }
 
   let detailRowCount = 0;
+  for (const filename of coverage.missingPatchFiles) {
+    if (detailRowCount >= MAX_SUMMARY_ROWS) {
+      break;
+    }
+    rows.push(["Unscanned file", "Patch text unavailable", filename]);
+    detailRowCount += 1;
+  }
+
   for (const finding of secretFindings) {
     if (detailRowCount >= MAX_SUMMARY_ROWS) {
       break;
@@ -281,11 +191,16 @@ async function writeSummary(
     if (detailRowCount >= MAX_SUMMARY_ROWS) {
       break;
     }
-    rows.push(["High-risk path", finding.ruleName, finding.file]);
+    const pathDescription =
+      finding.previousFilename !== undefined && finding.previousFilename !== finding.file
+        ? `${finding.previousFilename} → ${finding.file}`
+        : finding.affectedPath;
+    rows.push(["High-risk path", finding.ruleName, pathDescription]);
     detailRowCount += 1;
   }
 
-  if (secretFindings.length + riskFindings.length > detailRowCount) {
+  const totalDetails = coverage.missingPatchFiles.length + secretFindings.length + riskFindings.length;
+  if (totalDetails > detailRowCount) {
     rows.push(["Additional findings", "Omitted from detail table", "Counts above include every finding"]);
   }
 
@@ -295,7 +210,7 @@ async function writeSummary(
     .addTable(rows)
     .addHeading("Scan limits", 3)
     .addList([
-      "Sensitive-value checks inspect added lines from patch text returned by GitHub; missing patch text, binary files, and truncated diffs are not scanned.",
+      "Sensitive-value checks inspect only added lines in patch text returned by GitHub. A complete-for-returned-files status does not prove GitHub returned every diff line; review large and binary changes separately.",
       "Pattern checks can produce false positives or miss unknown credential formats. Review findings with a secret scanner and rotate any exposed credential.",
       "High-risk paths are heuristic review prompts, not proof that a change is unsafe.",
     ]);
@@ -337,7 +252,17 @@ async function getChangedFiles(token: string, pullRequestNumber: number): Promis
     },
   );
 
-  return files.map((file: ChangedFile) => ({ filename: file.filename, status: file.status, patch: file.patch }));
+  return files.map((file: PullRequestApiFile) => {
+    const changedFile: ChangedFile = {
+      filename: file.filename,
+      status: file.status,
+      patch: file.patch,
+    };
+    if (file.previous_filename !== undefined) {
+      changedFile.previousFilename = file.previous_filename;
+    }
+    return changedFile;
+  });
 }
 
 async function main(): Promise<void> {
@@ -345,6 +270,9 @@ async function main(): Promise<void> {
   const githubToken = core.getInput("github-token", { required: true });
   const failOnSecrets = core.getBooleanInput("fail-on-secrets");
   const failOnRiskyPaths = core.getBooleanInput("fail-on-risky-paths");
+  const failOnIncompleteScan = core.getBooleanInput("fail-on-incomplete-scan");
+  const timeoutInput = core.getInput("command-timeout-minutes") || String(DEFAULT_COMMAND_TIMEOUT_MINUTES);
+  const commandTimeoutMinutes = parseCommandTimeoutMinutes(timeoutInput);
   const repositoryPath = process.env.GITHUB_WORKSPACE;
 
   if (repositoryPath === undefined || repositoryPath.length === 0) {
@@ -361,6 +289,7 @@ async function main(): Promise<void> {
 
   const secretFindings = findSecretPatterns(files);
   const riskFindings = findHighRiskPaths(files);
+  const scanCoverage = getScanCoverage(files);
   const checkCommands: CheckCommand[] = [];
   const testCommand = core.getInput("test-command");
   const lintCommand = core.getInput("lint-command");
@@ -378,18 +307,23 @@ async function main(): Promise<void> {
 
   const checkResults: CheckResult[] = [];
   for (const checkCommand of checkCommands) {
-    checkResults.push(await runCheck(checkCommand.name, checkCommand.command, repositoryPath));
+    checkResults.push(await runCheck(checkCommand.name, checkCommand.command, repositoryPath, commandTimeoutMinutes));
   }
 
-  addFindingAnnotations(secretFindings, riskFindings);
-  await writeSummary(files, secretFindings, riskFindings, checkResults);
+  addFindingAnnotations(secretFindings, riskFindings, scanCoverage);
+  await writeSummary(files, secretFindings, riskFindings, scanCoverage, checkResults);
 
   core.setOutput("changed-files", String(files.length));
   core.setOutput("secret-findings", String(secretFindings.length));
   core.setOutput("high-risk-paths", String(riskFindings.length));
+  core.setOutput("scan-coverage-complete", String(scanCoverage.completeForReturnedFiles));
+  core.setOutput("unscanned-files", String(scanCoverage.missingPatchFiles.length));
 
   const failedChecks = checkResults.some((result) => !result.succeeded);
-  const blockingFindings = (failOnSecrets && secretFindings.length > 0) || (failOnRiskyPaths && riskFindings.length > 0);
+  const blockingFindings =
+    (failOnSecrets && secretFindings.length > 0) ||
+    (failOnRiskyPaths && riskFindings.length > 0) ||
+    (failOnIncompleteScan && !scanCoverage.completeForReturnedFiles);
 
   if (failedChecks || blockingFindings) {
     const reasons: string[] = [];
@@ -401,6 +335,9 @@ async function main(): Promise<void> {
     }
     if (failOnRiskyPaths && riskFindings.length > 0) {
       reasons.push("high-risk paths changed");
+    }
+    if (failOnIncompleteScan && !scanCoverage.completeForReturnedFiles) {
+      reasons.push("sensitive-pattern scan coverage is incomplete");
     }
     core.setFailed(`PatchProof failed because ${reasons.join(" and ")}. See the step summary for details.`);
   }

@@ -20,12 +20,20 @@ inputs:
     description: Optional shell command to run as the build check.
     required: false
     default: ""
+  command-timeout-minutes:
+    description: Per-command timeout in whole minutes (1-360); timed-out process trees are terminated.
+    required: false
+    default: "10"
   fail-on-secrets:
     description: Fail the action when a known sensitive-value pattern appears on an added diff line.
     required: false
     default: "true"
   fail-on-risky-paths:
     description: Fail the action when a high-risk repository path changes.
+    required: false
+    default: "false"
+  fail-on-incomplete-scan:
+    description: Fail when a returned file lacks patch text or the file-list API cap may have been reached.
     required: false
     default: "false"
 outputs:
@@ -35,6 +43,10 @@ outputs:
     description: Number of sensitive-value pattern matches in available added diff lines.
   high-risk-paths:
     description: Number of changed paths that match a high-risk rule.
+  scan-coverage-complete:
+    description: Whether every returned file had non-empty patch text and the result stayed below the API cap.
+  unscanned-files:
+    description: Number of returned files without patch text.
 runs:
   using: node24
   main: dist/index.js

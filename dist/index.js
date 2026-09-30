@@ -37288,12 +37288,7 @@ function getOctokit(token, options, ...additionalPlugins) {
 //# sourceMappingURL=github.js.map
 ;// CONCATENATED MODULE: external "node:child_process"
 const external_node_child_process_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:child_process");
-;// CONCATENATED MODULE: ./src/index.ts
-
-
-
-const MAX_ANNOTATIONS = 30;
-const MAX_SUMMARY_ROWS = 250;
+;// CONCATENATED MODULE: ./src/safety.ts
 const CREDENTIAL_ENVIRONMENT_NAME = /(?:token|secret|password|passwd|credential|private.?key|access.?key|auth)/i;
 const ACTION_CONTROL_FILE_ENVIRONMENT_NAMES = new Set([
     "GITHUB_ENV",
@@ -37302,10 +37297,179 @@ const ACTION_CONTROL_FILE_ENVIRONMENT_NAMES = new Set([
     "GITHUB_STEP_SUMMARY",
     "GITHUB_STATE",
 ]);
+/** Remove Actions command files, runtime credentials, action inputs, and credential-named variables before running untrusted commands. */
+function sanitizeChildEnvironment(environment) {
+    const safeEnvironment = {};
+    for (const [name, value] of Object.entries(environment)) {
+        const normalizedName = name.toUpperCase();
+        if (value === undefined ||
+            ACTION_CONTROL_FILE_ENVIRONMENT_NAMES.has(normalizedName) ||
+            normalizedName.startsWith("ACTIONS_") ||
+            normalizedName.startsWith("INPUT_") ||
+            CREDENTIAL_ENVIRONMENT_NAME.test(name)) {
+            continue;
+        }
+        safeEnvironment[name] = value;
+    }
+    return safeEnvironment;
+}
+
+;// CONCATENATED MODULE: ./src/commands.ts
+
+
+const DEFAULT_COMMAND_TIMEOUT_MINUTES = 10;
+const MAX_COMMAND_TIMEOUT_MINUTES = 360;
+const PROCESS_TERMINATION_GRACE_MS = 5000;
+function processGroupExists(processId) {
+    try {
+        process.kill(-processId, 0);
+        return true;
+    }
+    catch (error) {
+        return error.code !== "ESRCH";
+    }
+}
+function clearTerminationTimers(termination) {
+    clearTimeout(termination.forceKillTimer);
+    if (termination.processGroupMonitor !== undefined) {
+        clearInterval(termination.processGroupMonitor);
+        termination.processGroupMonitor = undefined;
+    }
+}
+function parseCommandTimeoutMinutes(input) {
+    const timeoutMinutes = Number(input);
+    if (!Number.isSafeInteger(timeoutMinutes) ||
+        timeoutMinutes < 1 ||
+        timeoutMinutes > MAX_COMMAND_TIMEOUT_MINUTES) {
+        throw new Error(`command-timeout-minutes must be a whole number between 1 and ${MAX_COMMAND_TIMEOUT_MINUTES}.`);
+    }
+    return timeoutMinutes;
+}
+function terminateProcessTree(childProcess, forceKillDelayMs) {
+    const processId = childProcess.pid;
+    if (processId === undefined) {
+        childProcess.kill();
+        return undefined;
+    }
+    if (process.platform === "win32") {
+        let fallbackSent = false;
+        const fallbackToDirectKill = () => {
+            if (!fallbackSent && childProcess.exitCode === null) {
+                fallbackSent = true;
+                childProcess.kill();
+            }
+        };
+        try {
+            const treeTerminator = (0,external_node_child_process_namespaceObject.spawn)("taskkill.exe", ["/PID", String(processId), "/T", "/F"], {
+                stdio: "ignore",
+                windowsHide: true,
+            });
+            treeTerminator.once("error", fallbackToDirectKill);
+            treeTerminator.once("close", (exitCode) => {
+                if (exitCode !== 0) {
+                    fallbackToDirectKill();
+                }
+            });
+        }
+        catch {
+            fallbackToDirectKill();
+        }
+        return undefined;
+    }
+    try {
+        process.kill(-processId, "SIGTERM");
+    }
+    catch (error) {
+        const errorCode = error.code;
+        if (errorCode !== "ESRCH") {
+            process.stderr.write(`Could not signal the command process group: ${String(error)}\n`);
+            childProcess.kill("SIGTERM");
+        }
+    }
+    const termination = {
+        forceKillTimer: setTimeout(() => {
+            termination.forceKillAttempted = true;
+            if (!processGroupExists(processId)) {
+                clearTerminationTimers(termination);
+                return;
+            }
+            try {
+                process.kill(-processId, "SIGKILL");
+            }
+            catch (error) {
+                const errorCode = error.code;
+                if (errorCode !== "ESRCH") {
+                    process.stderr.write(`Could not force-stop the command process group: ${String(error)}\n`);
+                }
+            }
+            if (termination.processGroupMonitor !== undefined) {
+                clearInterval(termination.processGroupMonitor);
+                termination.processGroupMonitor = undefined;
+            }
+        }, forceKillDelayMs),
+        forceKillAttempted: false,
+    };
+    return termination;
+}
+/** Run a workflow-authored shell command with a hard timeout and process-tree cleanup. */
+function runShellCommand(command, cwd, timeoutMs, forceKillDelayMs = PROCESS_TERMINATION_GRACE_MS) {
+    return new Promise((resolve) => {
+        let childProcess;
+        try {
+            childProcess = (0,external_node_child_process_namespaceObject.spawn)(command, [], {
+                cwd,
+                env: sanitizeChildEnvironment(process.env),
+                shell: true,
+                stdio: "inherit",
+                windowsHide: true,
+                detached: process.platform !== "win32",
+            });
+        }
+        catch {
+            resolve({ started: false, exitCode: null, timedOut: false });
+            return;
+        }
+        let spawnFailed = false;
+        let timedOut = false;
+        let timeoutTimer;
+        let termination;
+        childProcess.once("error", () => {
+            spawnFailed = true;
+        });
+        childProcess.once("close", (exitCode) => {
+            if (timeoutTimer !== undefined) {
+                clearTimeout(timeoutTimer);
+            }
+            const activeTermination = termination;
+            if (activeTermination !== undefined) {
+                const processId = childProcess.pid;
+                const processGroupHasExited = processId === undefined || !processGroupExists(processId);
+                if (processGroupHasExited || activeTermination.forceKillAttempted) {
+                    clearTerminationTimers(activeTermination);
+                }
+                else {
+                    activeTermination.processGroupMonitor = setInterval(() => {
+                        if (processId === undefined || !processGroupExists(processId)) {
+                            clearTerminationTimers(activeTermination);
+                        }
+                    }, 25);
+                }
+            }
+            resolve({ started: !spawnFailed, exitCode, timedOut });
+        });
+        timeoutTimer = setTimeout(() => {
+            timedOut = true;
+            termination = terminateProcessTree(childProcess, forceKillDelayMs);
+        }, timeoutMs);
+    });
+}
+
+;// CONCATENATED MODULE: ./src/scan.ts
+const MAX_GITHUB_PULL_REQUEST_FILES = 3000;
 const PRIVATE_KEY_PATTERN = /-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----/i;
 const SECRET_PATTERNS = [
     { name: "Private key block", pattern: PRIVATE_KEY_PATTERN },
-    { name: "AWS access key ID", pattern: /\bAKIA[0-9A-Z]{16}\b/ },
+    { name: "AWS access key ID", pattern: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/ },
     { name: "GitHub token", pattern: /\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/ },
     { name: "Slack token", pattern: /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/ },
     { name: "Google API key", pattern: /\bAIza[0-9A-Za-z_-]{35}\b/ },
@@ -37328,17 +37492,26 @@ const HIGH_RISK_PATH_RULES = [
     },
     { name: "Environment, package, or authentication configuration", pattern: /(^|\/)(?:\.npmrc|\.env(?:\.[^/]*)?|[^/]*(?:auth|permission|secret|deploy)[^/]*\.ya?ml)$/i },
 ];
-/** Extract added lines and their new-file line numbers from a unified diff patch. */
+/** Extract added lines from unified diff text without confusing added `++` lines for file headers. */
 function getAddedLines(patch) {
     const addedLines = [];
     let newLineNumber = 0;
+    let insideHunk = false;
     for (const line of patch.split(/\r?\n/)) {
+        if (line.startsWith("diff --git ")) {
+            insideHunk = false;
+            continue;
+        }
         const hunkMatch = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
         if (hunkMatch !== null) {
+            insideHunk = true;
             newLineNumber = Number(hunkMatch[1]);
             continue;
         }
-        if (line.startsWith("+++") || line.startsWith("\\")) {
+        if (!insideHunk) {
+            continue;
+        }
+        if (line.startsWith("\\")) {
             continue;
         }
         if (line.startsWith("+")) {
@@ -37355,7 +37528,7 @@ function getAddedLines(patch) {
 function findSecretPatterns(files) {
     const findings = [];
     for (const file of files) {
-        if (file.patch === undefined) {
+        if (typeof file.patch !== "string" || file.patch.length === 0) {
             continue;
         }
         for (const addedLine of getAddedLines(file.patch)) {
@@ -37371,62 +37544,61 @@ function findSecretPatterns(files) {
 function findHighRiskPaths(files) {
     const findings = [];
     for (const file of files) {
-        const matchingRule = HIGH_RISK_PATH_RULES.find((rule) => rule.pattern.test(file.filename));
-        if (matchingRule !== undefined) {
-            findings.push({ file: file.filename, ruleName: matchingRule.name });
+        const changedPaths = [file.filename];
+        if (file.previousFilename !== undefined && file.previousFilename !== file.filename) {
+            changedPaths.push(file.previousFilename);
+        }
+        for (const changedPath of changedPaths) {
+            const matchingRule = HIGH_RISK_PATH_RULES.find((rule) => rule.pattern.test(changedPath));
+            if (matchingRule !== undefined) {
+                findings.push({
+                    file: file.filename,
+                    affectedPath: changedPath,
+                    previousFilename: file.previousFilename,
+                    ruleName: matchingRule.name,
+                });
+                break;
+            }
         }
     }
     return findings;
 }
-function getSafeChildEnvironment() {
-    const safeEnvironment = {};
-    for (const [name, value] of Object.entries(process.env)) {
-        const normalizedName = name.toUpperCase();
-        if (value === undefined ||
-            ACTION_CONTROL_FILE_ENVIRONMENT_NAMES.has(normalizedName) ||
-            normalizedName.startsWith("ACTIONS_") ||
-            normalizedName.startsWith("INPUT_") ||
-            CREDENTIAL_ENVIRONMENT_NAME.test(name)) {
-            continue;
-        }
-        safeEnvironment[name] = value;
-    }
-    return safeEnvironment;
+function getScanCoverage(files) {
+    const missingPatchFiles = files
+        .filter((file) => typeof file.patch !== "string" || file.patch.length === 0)
+        .map((file) => file.filename);
+    const fileLimitReached = files.length >= MAX_GITHUB_PULL_REQUEST_FILES;
+    return {
+        completeForReturnedFiles: missingPatchFiles.length === 0 && !fileLimitReached,
+        missingPatchFiles,
+        fileLimitReached,
+    };
 }
-function runCheck(name, command, cwd) {
-    return new Promise((resolve) => {
-        info(`Running configured ${name} check.`);
-        let childProcess;
-        try {
-            childProcess = (0,external_node_child_process_namespaceObject.spawn)(command, [], {
-                cwd,
-                env: getSafeChildEnvironment(),
-                shell: true,
-                stdio: "inherit",
-                windowsHide: true,
-            });
-        }
-        catch {
-            warning(`The configured ${name} check could not be started.`);
-            resolve({ name, succeeded: false, exitCode: null });
-            return;
-        }
-        let spawnFailed = false;
-        childProcess.once("error", () => {
-            spawnFailed = true;
-            warning(`The configured ${name} check could not be started.`);
-        });
-        childProcess.once("close", (exitCode) => {
-            const succeeded = !spawnFailed && exitCode === 0;
-            if (succeeded) {
-                info(`Configured ${name} check passed.`);
-            }
-            else {
-                warning(`Configured ${name} check failed${exitCode === null ? "" : ` with exit code ${exitCode}`}.`);
-            }
-            resolve({ name, succeeded, exitCode });
-        });
-    });
+
+;// CONCATENATED MODULE: ./src/index.ts
+
+
+
+
+const MAX_ANNOTATIONS = 30;
+const MAX_SUMMARY_ROWS = 250;
+async function runCheck(name, command, cwd, timeoutMinutes) {
+    info(`Running configured ${name} check.`);
+    const result = await runShellCommand(command, cwd, timeoutMinutes * 60 * 1000);
+    const succeeded = result.started && !result.timedOut && result.exitCode === 0;
+    if (succeeded) {
+        info(`Configured ${name} check passed.`);
+    }
+    else if (!result.started) {
+        warning(`The configured ${name} check could not be started.`);
+    }
+    else if (result.timedOut) {
+        warning(`Configured ${name} check exceeded ${timeoutMinutes} minutes and was terminated.`);
+    }
+    else {
+        warning(`Configured ${name} check failed${result.exitCode === null ? "" : ` with exit code ${result.exitCode}`}.`);
+    }
+    return { name, succeeded, exitCode: result.exitCode, timedOut: result.timedOut, timeoutMinutes };
 }
 function escapeMarkdownCell(value) {
     return value
@@ -37441,8 +37613,12 @@ function addTable(summary, rows) {
     const safeRows = rows.map((row) => row.map(escapeMarkdownCell));
     summary.addTable(safeRows);
 }
-function addFindingAnnotations(secretFindings, riskFindings) {
+function addFindingAnnotations(secretFindings, riskFindings, coverage) {
     let annotationCount = 0;
+    if (!coverage.completeForReturnedFiles && annotationCount < MAX_ANNOTATIONS) {
+        warning("Sensitive-pattern scan coverage is incomplete. See the step summary for missing patch files or a possible API cap.");
+        annotationCount += 1;
+    }
     for (const finding of secretFindings) {
         if (annotationCount >= MAX_ANNOTATIONS) {
             break;
@@ -37468,24 +37644,56 @@ function addFindingAnnotations(secretFindings, riskFindings) {
         info(`Annotations were capped at ${MAX_ANNOTATIONS}; the summary reports all findings.`);
     }
 }
-async function writeSummary(files, secretFindings, riskFindings, checkResults) {
+async function writeSummary(files, secretFindings, riskFindings, coverage, checkResults) {
     const summary = summary_summary;
-    const patchAvailableCount = files.filter((file) => file.patch !== undefined).length;
+    const patchAvailableCount = files.length - coverage.missingPatchFiles.length;
+    const coverageReasons = [];
+    if (coverage.missingPatchFiles.length > 0) {
+        coverageReasons.push(`${coverage.missingPatchFiles.length} returned file(s) had no patch text`);
+    }
+    if (coverage.fileLimitReached) {
+        coverageReasons.push(`the ${MAX_GITHUB_PULL_REQUEST_FILES}-file API response cap may have been reached`);
+    }
     const rows = [
         ["Check", "Result", "Details"],
         ["Changed files", String(files.length), "Files returned by the GitHub pull request API"],
-        ["Patch availability", `${patchAvailableCount}/${files.length}`, "Some binary or large-file diffs may not include patch text"],
+        [
+            "Diff coverage",
+            coverage.completeForReturnedFiles ? "No known omissions" : "INCOMPLETE",
+            coverageReasons.length > 0
+                ? coverageReasons.join("; ")
+                : "Every returned file included patch text and the result stayed below the API cap",
+        ],
+        ["Patch text", `${patchAvailableCount}/${files.length}`, "Returned files with non-empty patch text"],
+        ["Potential API truncation", coverage.fileLimitReached ? "Possible" : "Not indicated", "At the cap, additional files may be omitted"],
         ["Sensitive patterns", String(secretFindings.length), "Known patterns found on added diff lines only"],
         ["High-risk paths", String(riskFindings.length), "Changed workflow, dependency, build, ownership, or security configuration"],
     ];
     for (const result of checkResults) {
+        let details;
+        if (result.timedOut) {
+            details = `Timed out after ${result.timeoutMinutes} minutes`;
+        }
+        else if (result.exitCode === null) {
+            details = "Could not start";
+        }
+        else {
+            details = `Exit code ${result.exitCode}`;
+        }
         rows.push([
             `${result.name} command`,
             result.succeeded ? "Passed" : "Failed",
-            result.exitCode === null ? "Could not start" : `Exit code ${result.exitCode}`,
+            details,
         ]);
     }
     let detailRowCount = 0;
+    for (const filename of coverage.missingPatchFiles) {
+        if (detailRowCount >= MAX_SUMMARY_ROWS) {
+            break;
+        }
+        rows.push(["Unscanned file", "Patch text unavailable", filename]);
+        detailRowCount += 1;
+    }
     for (const finding of secretFindings) {
         if (detailRowCount >= MAX_SUMMARY_ROWS) {
             break;
@@ -37497,10 +37705,14 @@ async function writeSummary(files, secretFindings, riskFindings, checkResults) {
         if (detailRowCount >= MAX_SUMMARY_ROWS) {
             break;
         }
-        rows.push(["High-risk path", finding.ruleName, finding.file]);
+        const pathDescription = finding.previousFilename !== undefined && finding.previousFilename !== finding.file
+            ? `${finding.previousFilename} → ${finding.file}`
+            : finding.affectedPath;
+        rows.push(["High-risk path", finding.ruleName, pathDescription]);
         detailRowCount += 1;
     }
-    if (secretFindings.length + riskFindings.length > detailRowCount) {
+    const totalDetails = coverage.missingPatchFiles.length + secretFindings.length + riskFindings.length;
+    if (totalDetails > detailRowCount) {
         rows.push(["Additional findings", "Omitted from detail table", "Counts above include every finding"]);
     }
     summary
@@ -37509,7 +37721,7 @@ async function writeSummary(files, secretFindings, riskFindings, checkResults) {
         .addTable(rows)
         .addHeading("Scan limits", 3)
         .addList([
-        "Sensitive-value checks inspect added lines from patch text returned by GitHub; missing patch text, binary files, and truncated diffs are not scanned.",
+        "Sensitive-value checks inspect only added lines in patch text returned by GitHub. A complete-for-returned-files status does not prove GitHub returned every diff line; review large and binary changes separately.",
         "Pattern checks can produce false positives or miss unknown credential formats. Review findings with a secret scanner and rotate any exposed credential.",
         "High-risk paths are heuristic review prompts, not proof that a change is unsafe.",
     ]);
@@ -37540,13 +37752,26 @@ async function getChangedFiles(token, pullRequestNumber) {
         pull_number: pullRequestNumber,
         per_page: 100,
     });
-    return files.map((file) => ({ filename: file.filename, status: file.status, patch: file.patch }));
+    return files.map((file) => {
+        const changedFile = {
+            filename: file.filename,
+            status: file.status,
+            patch: file.patch,
+        };
+        if (file.previous_filename !== undefined) {
+            changedFile.previousFilename = file.previous_filename;
+        }
+        return changedFile;
+    });
 }
 async function main() {
     const pullRequestNumber = getPullRequestNumber();
     const githubToken = getInput("github-token", { required: true });
     const failOnSecrets = getBooleanInput("fail-on-secrets");
     const failOnRiskyPaths = getBooleanInput("fail-on-risky-paths");
+    const failOnIncompleteScan = getBooleanInput("fail-on-incomplete-scan");
+    const timeoutInput = getInput("command-timeout-minutes") || String(DEFAULT_COMMAND_TIMEOUT_MINUTES);
+    const commandTimeoutMinutes = parseCommandTimeoutMinutes(timeoutInput);
     const repositoryPath = process.env.GITHUB_WORKSPACE;
     if (repositoryPath === undefined || repositoryPath.length === 0) {
         throw new Error("GITHUB_WORKSPACE is not available. Run PatchProof in a GitHub Actions job with a checked-out workspace.");
@@ -37561,6 +37786,7 @@ async function main() {
     }
     const secretFindings = findSecretPatterns(files);
     const riskFindings = findHighRiskPaths(files);
+    const scanCoverage = getScanCoverage(files);
     const checkCommands = [];
     const testCommand = getInput("test-command");
     const lintCommand = getInput("lint-command");
@@ -37576,15 +37802,19 @@ async function main() {
     }
     const checkResults = [];
     for (const checkCommand of checkCommands) {
-        checkResults.push(await runCheck(checkCommand.name, checkCommand.command, repositoryPath));
+        checkResults.push(await runCheck(checkCommand.name, checkCommand.command, repositoryPath, commandTimeoutMinutes));
     }
-    addFindingAnnotations(secretFindings, riskFindings);
-    await writeSummary(files, secretFindings, riskFindings, checkResults);
+    addFindingAnnotations(secretFindings, riskFindings, scanCoverage);
+    await writeSummary(files, secretFindings, riskFindings, scanCoverage, checkResults);
     setOutput("changed-files", String(files.length));
     setOutput("secret-findings", String(secretFindings.length));
     setOutput("high-risk-paths", String(riskFindings.length));
+    setOutput("scan-coverage-complete", String(scanCoverage.completeForReturnedFiles));
+    setOutput("unscanned-files", String(scanCoverage.missingPatchFiles.length));
     const failedChecks = checkResults.some((result) => !result.succeeded);
-    const blockingFindings = (failOnSecrets && secretFindings.length > 0) || (failOnRiskyPaths && riskFindings.length > 0);
+    const blockingFindings = (failOnSecrets && secretFindings.length > 0) ||
+        (failOnRiskyPaths && riskFindings.length > 0) ||
+        (failOnIncompleteScan && !scanCoverage.completeForReturnedFiles);
     if (failedChecks || blockingFindings) {
         const reasons = [];
         if (failedChecks) {
@@ -37595,6 +37825,9 @@ async function main() {
         }
         if (failOnRiskyPaths && riskFindings.length > 0) {
             reasons.push("high-risk paths changed");
+        }
+        if (failOnIncompleteScan && !scanCoverage.completeForReturnedFiles) {
+            reasons.push("sensitive-pattern scan coverage is incomplete");
         }
         setFailed(`PatchProof failed because ${reasons.join(" and ")}. See the step summary for details.`);
     }

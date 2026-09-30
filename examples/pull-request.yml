@@ -10,7 +10,7 @@ permissions:
 jobs:
   review-evidence:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
         with:
@@ -19,6 +19,8 @@ jobs:
         uses: Andy123211/patchproof@v1
         with:
           github-token: ${{ github.token }}
+          command-timeout-minutes: 10
+          fail-on-incomplete-scan: true
           test-command: npm test --if-present
           lint-command: npm run lint --if-present
           build-command: npm run build --if-present

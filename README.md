@@ -28,7 +28,7 @@ permissions:
 jobs:
   patchproof:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
         with:
@@ -37,6 +37,8 @@ jobs:
         uses: Andy123211/patchproof@v1
         with:
           github-token: ${{ github.token }}
+          command-timeout-minutes: 10
+          fail-on-incomplete-scan: true
           test-command: npm test --if-present
           lint-command: npm run lint --if-present
           build-command: npm run build --if-present
@@ -52,10 +54,12 @@ The action supports these inputs:
 | `test-command` | No | Empty | Shell command for the test check. |
 | `lint-command` | No | Empty | Shell command for the lint check. |
 | `build-command` | No | Empty | Shell command for the build check. |
+| `command-timeout-minutes` | No | `10` | Per-command timeout, from 1 to 360 whole minutes. Timed-out process trees are terminated. |
 | `fail-on-secrets` | No | `true` | Fail when a known sensitive-value pattern is found. |
 | `fail-on-risky-paths` | No | `false` | Make high-risk path changes fail instead of warn. |
+| `fail-on-incomplete-scan` | No | `false` | Fail when returned files lack patch text or the GitHub file-list cap may have been reached. |
 
-Configured commands run sequentially. A non-zero exit status fails the action. If a command is omitted, it is skipped. Risky paths are warnings by default; set `fail-on-risky-paths: true` to make them blocking.
+Configured commands run sequentially. A non-zero exit status or command timeout fails the action. If a command is omitted, it is skipped. Risky paths and incomplete scan coverage are warnings by default; set the corresponding `fail-on-*` input to make them blocking. The workflow job should also have an overall `timeout-minutes` limit.
 
 ## Security notes
 
@@ -69,7 +73,7 @@ Configured commands run sequentially. A non-zero exit status fails the action. I
 
 ## Scan coverage and limits
 
-The secret-pattern scan examines only added lines in unified diff text provided by the GitHub pull request files API. GitHub may omit patch text for binary, large, or otherwise unsupported diffs; this is shown in the step summary. GitHub also limits the number of files returned by that endpoint. Patterns cannot recognize every credential format, and a clean report is not proof that a change is safe. Use a dedicated secret scanner for broader coverage.
+The secret-pattern scan examines only added lines in non-empty unified diff text provided by the GitHub pull request files API. The summary lists files without patch text and marks coverage incomplete; it also warns when the response reaches GitHub's 3,000-file cap, where additional files may be omitted. The `scan-coverage-complete` output means only that every returned file had patch text and the cap was not reached; it cannot prove GitHub returned every diff line. Patterns cannot recognize every credential format, and a clean report is not proof that a change is safe. Use a dedicated secret scanner for broader coverage.
 
 Sensitive values are never included in PatchProof's own annotation or summary text. GitHub annotations are capped to keep large pull requests usable; counts and detail rows remain in the step summary.
 
@@ -79,11 +83,12 @@ Requires Node.js 24 or newer.
 
 ```sh
 npm install
+npm run test
 npm run typecheck
 npm run build
 ```
 
-`npm run build` type-checks the TypeScript source and bundles `src/index.ts` into `dist/index.js`, which is committed so GitHub can execute the action without installing dependencies.
+`npm run test` runs the built-in Node.js regression tests. GitHub Actions CI runs the tests, type check, and build on Node.js 24, then verifies that the committed bundle is up to date. `npm run build` type-checks the TypeScript source and bundles `src/index.ts` into `dist/index.js`, which is committed so GitHub can execute the action without installing dependencies.
 
 ## License
 
@@ -97,4 +102,4 @@ PatchProof 是一个 GitHub Action：它读取 PR 文件列表和 GitHub 提供�
 
 请只在干净、临时的 GitHub 托管 Runner 上，以 `pull_request` 事件和只读 `GITHUB_TOKEN` 运行不可信 PR 命令。不要使用 `pull_request_target`、持久化或自托管 Runner，也不要暴露仓库密钥。命令由工作流作者配置，会在检出的 PR 代码上执行；子命令不会继承 Actions 控制文件路径或 `ACTIONS_*` 运行时变量。
 
-扫描仅覆盖 GitHub API 返回的 diff 文本；二进制、大文件或缺少 patch 的改动不会被完整扫描。规则可能误报，也可能漏报，不能替代专用密钥扫描器和人工审查。
+扫描只检查 GitHub API 返回的非空 diff 新增行。摘要会列出缺少 patch 文本的文件，并在达到 3,000 文件 API 上限时标记覆盖不完整；`scan-coverage-complete` 只表示返回的文件都有 patch 且未触及该上限，不保证 API 返回了每一行 diff。命令默认每条 10 分钟超时。规则可能误报或漏报，不能替代专用密钥扫描器和人工审查。
