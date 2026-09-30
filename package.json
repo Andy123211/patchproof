@@ -1,0 +1,24 @@
+{
+  "name": "patchproof-action",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Evidence-based pull request checks for GitHub Actions.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "npm run typecheck && ncc build src/index.ts -o dist"
+  },
+  "dependencies": {
+    "@actions/core": "^3.0.1",
+    "@actions/github": "^9.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@vercel/ncc": "^0.38.3",
+    "typescript": "^5.9.2"
+  }
+}

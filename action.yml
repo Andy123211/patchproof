@@ -1,0 +1,40 @@
+name: PatchProof
+description: Evidence-based pull request checks with secret-pattern and high-risk-path warnings.
+author: Andy123211
+branding:
+  icon: shield
+  color: blue
+inputs:
+  github-token:
+    description: Token used only to read changed pull request files.
+    required: true
+  test-command:
+    description: Optional shell command to run as the test check.
+    required: false
+    default: ""
+  lint-command:
+    description: Optional shell command to run as the lint check.
+    required: false
+    default: ""
+  build-command:
+    description: Optional shell command to run as the build check.
+    required: false
+    default: ""
+  fail-on-secrets:
+    description: Fail the action when a known sensitive-value pattern appears on an added diff line.
+    required: false
+    default: "true"
+  fail-on-risky-paths:
+    description: Fail the action when a high-risk repository path changes.
+    required: false
+    default: "false"
+outputs:
+  changed-files:
+    description: Number of changed files returned by the GitHub pull request API.
+  secret-findings:
+    description: Number of sensitive-value pattern matches in available added diff lines.
+  high-risk-paths:
+    description: Number of changed paths that match a high-risk rule.
+runs:
+  using: node24
+  main: dist/index.js

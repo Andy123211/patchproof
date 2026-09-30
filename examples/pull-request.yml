@@ -1,0 +1,24 @@
+name: PatchProof example
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  review-evidence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check the pull request
+        uses: Andy123211/patchproof@v1
+        with:
+          github-token: ${{ github.token }}
+          test-command: npm test --if-present
+          lint-command: npm run lint --if-present
+          build-command: npm run build --if-present
